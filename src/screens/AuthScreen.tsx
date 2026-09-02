@@ -27,8 +27,8 @@ export const AuthScreen: React.FC = () => {
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
   // Login Form
-  const [loginIdentifier, setLoginIdentifier] = useState('');
-  const [loginPin, setLoginPin] = useState('');
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
 
   // Register Form
   const [fullName, setFullName] = useState('');
@@ -44,7 +44,7 @@ export const AuthScreen: React.FC = () => {
     setErrorMsg(null);
     setSuccessMsg(null);
 
-    const result = await loginStudent(loginIdentifier, loginPin);
+    const result = await loginStudent(loginEmail, loginPassword);
     if (!result.success) {
       setErrorMsg(result.message);
     }
@@ -142,18 +142,18 @@ export const AuthScreen: React.FC = () => {
           <form onSubmit={handleLoginSubmit} className="space-y-4">
             <div>
               <label className="block text-xs font-bold text-[#44474F] uppercase tracking-wider mb-1.5">
-                Matriculation No. / Email
+                Email Address
               </label>
               <div className="relative">
                 <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-[#74777F]">
                   <Mail className="w-4 h-4" />
                 </div>
                 <input
-                  type="text"
+                  type="email"
                   required
-                  value={loginIdentifier}
-                  onChange={(e) => setLoginIdentifier(e.target.value)}
-                  placeholder="e.g. ND/CTE/M/24/0001 or ND/CTE/M/25/0001"
+                  value={loginEmail}
+                  onChange={(e) => setLoginEmail(e.target.value)}
+                  placeholder="e.g. student@jigawapoly.edu.ng"
                   className="w-full pl-10 pr-4 py-3 bg-[#F7F9FF] border border-[#C4C6D0] rounded-xl text-sm font-medium text-[#1B1B1F] focus:outline-hidden focus:ring-2 focus:ring-[#005FB0] focus:border-transparent transition-all"
                 />
               </div>
@@ -161,7 +161,7 @@ export const AuthScreen: React.FC = () => {
 
             <div>
               <label className="block text-xs font-bold text-[#44474F] uppercase tracking-wider mb-1.5">
-                Security Password / PIN
+                Password
               </label>
               <div className="relative">
                 <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-[#74777F]">
@@ -170,9 +170,9 @@ export const AuthScreen: React.FC = () => {
                 <input
                   type={showPassword ? 'text' : 'password'}
                   required
-                  value={loginPin}
-                  onChange={(e) => setLoginPin(e.target.value)}
-                  placeholder="Enter your PIN / Password"
+                  value={loginPassword}
+                  onChange={(e) => setLoginPassword(e.target.value)}
+                  placeholder="Enter your password"
                   className="w-full pl-10 pr-10 py-3 bg-[#F7F9FF] border border-[#C4C6D0] rounded-xl text-sm font-medium text-[#1B1B1F] focus:outline-hidden focus:ring-2 focus:ring-[#005FB0] focus:border-transparent transition-all"
                 />
                 <button

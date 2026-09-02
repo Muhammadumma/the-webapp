@@ -90,6 +90,17 @@ export interface AlertItem {
   stageId?: number | null;
 }
 
+export interface RequirementPolicy {
+  id: string;
+  stageId: string;
+  name: string;
+  description: string;
+  required: boolean;
+  allowedFileTypes: string[];
+  maxFileSize: number;
+  active: boolean;
+}
+
 export interface StudentProfile {
   studentId: string;
   fullName: string;

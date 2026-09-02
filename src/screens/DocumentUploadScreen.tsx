@@ -10,7 +10,8 @@ import {
   CheckCircle2,
   AlertCircle,
   Building,
-  Trash2
+  Trash2,
+  Loader2
 } from 'lucide-react';
 import { useClearance } from '../context/ClearanceContext';
 import { getRequirementForStage, departmentRequirements } from '../data/departmentRequirements';
@@ -22,69 +23,100 @@ export const DocumentUploadScreen: React.FC = () => {
     uploadScreenStageId,
     closeUploadScreen,
     submitDocument,
-    studentProfile
+    studentProfile,
+    getDynamicRequirementsForStage
   } = useClearance();
 
   const activeStageId = uploadScreenStageId || 1;
   const [selectedStageId, setSelectedStageId] = useState<number>(activeStageId);
 
   const stageReq = getRequirementForStage(selectedStageId);
+  const dynamicReqs = getDynamicRequirementsForStage(selectedStageId);
   const currentStage = stages.find(s => s.id === selectedStageId) || stages[0];
 
-  const [documentType, setDocumentType] = useState<string>(stageReq.primaryDocumentLabel);
+  const availableDocTypes = dynamicReqs.length > 0
+    ? dynamicReqs.map(r => r.name)
+    : stageReq.requiredDocuments;
+
+  const defaultDocType = availableDocTypes[0] || stageReq.primaryDocumentLabel;
+
+  const [documentType, setDocumentType] = useState<string>(defaultDocType);
   const [documentName, setDocumentName] = useState<string>('');
   const [receiptNumber, setReceiptNumber] = useState<string>('');
   const [paymentDate, setPaymentDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [remarks, setRemarks] = useState<string>('');
-  const [fileUri, setFileUri] = useState<string | null>(null);
+  const [fileUri, setFileUri] = useState<string | null>(null);         // local preview URI
+  const [pickedFile, setPickedFile] = useState<File | null>(null);     // raw File for GitHub upload
+  const [fileSizeKB, setFileSizeKB] = useState<number>(0);
+  const [isUploading, setIsUploading] = useState(false);
   const [showCameraModal, setShowCameraModal] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Update defaults when selected stage changes
   useEffect(() => {
-    const req = getRequirementForStage(selectedStageId);
-    setDocumentType(req.primaryDocumentLabel);
-    setDocumentName(`${studentProfile.matricNumber.replace(/\//g, '_')}_${req.primaryDocumentLabel.split(' ')[0]}.pdf`);
-    setReceiptNumber(`${req.defaultReceiptPrefix}${Math.floor(100000 + Math.random() * 900000)}`);
-  }, [selectedStageId, studentProfile]);
+    const dyn = getDynamicRequirementsForStage(selectedStageId);
+    const docTypes = dyn.length > 0 ? dyn.map(r => r.name) : stageReq.requiredDocuments;
+    const initialType = docTypes[0] || stageReq.primaryDocumentLabel;
+    setDocumentType(initialType);
+    setDocumentName(`${studentProfile.matricNumber.replace(/\//g, '_')}_${initialType.split(' ')[0]}.pdf`);
+    setReceiptNumber(`${stageReq.defaultReceiptPrefix}${Math.floor(100000 + Math.random() * 900000)}`);
+  }, [selectedStageId, studentProfile, dynamicReqs.length]);
 
   const handleFilePick = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      setDocumentName(file.name);
-      const reader = new FileReader();
-      reader.onload = () => {
-        setFileUri(reader.result as string);
-      };
-      reader.readAsDataURL(file);
+    if (!file) return;
+    // GitHub Contents API limit is 25 MB per file
+    if (file.size > 25 * 1024 * 1024) {
+      setErrorMsg(`File "${file.name}" is ${(file.size / (1024 * 1024)).toFixed(1)} MB. GitHub allows a maximum of 25 MB per file.`);
+      return;
     }
+    setErrorMsg(null);
+    setFileSizeKB(Math.round(file.size / 1024));
+    setDocumentName(file.name);
+    setPickedFile(file);
+    // Show a local preview
+    const reader = new FileReader();
+    reader.onload = () => setFileUri(reader.result as string);
+    reader.readAsDataURL(file);
   };
 
   const handleCameraCapture = (imageUri: string) => {
+    setErrorMsg(null);
+    const approxKB = Math.round((imageUri.length * 0.75) / 1024);
+    setFileSizeKB(approxKB);
     setFileUri(imageUri);
-    setDocumentName(`Camera_Receipt_${Date.now()}.jpg`);
+    setPickedFile(null); // camera gives a data URI, not a File
+    setDocumentName(`Receipt_Capture_${Date.now()}.jpg`);
   };
 
   const handleGenerateRandomReceipt = () => {
     setReceiptNumber(`${stageReq.defaultReceiptPrefix}${Math.floor(100000 + Math.random() * 900000)}`);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!documentName.trim()) {
-      setErrorMsg("Please specify document file or take a photo.");
+    if (!documentName.trim() && !pickedFile && !fileUri) {
+      setErrorMsg('Please attach a file or capture a photo before submitting.');
       return;
     }
-
-    submitDocument(
-      selectedStageId,
-      documentName,
-      receiptNumber,
-      paymentDate,
-      documentType,
-      fileUri,
-      remarks
-    );
+    setErrorMsg(null);
+    setIsUploading(true);
+    try {
+      await submitDocument(
+        selectedStageId,
+        documentName,
+        receiptNumber,
+        paymentDate,
+        documentType,
+        fileUri,       // fallback data URI for camera captures
+        remarks,
+        pickedFile     // preferred: actual File object → uploaded to GitHub
+      );
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Upload failed. Please try again.');
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   return (
@@ -164,7 +196,7 @@ export const DocumentUploadScreen: React.FC = () => {
               onChange={(e) => setDocumentType(e.target.value)}
               className="w-full px-3.5 py-2.5 bg-[#F7F9FF] border border-[#C4C6D0] rounded-xl text-xs sm:text-sm font-medium text-[#1B1B1F] focus:ring-2 focus:ring-[#005FB0] focus:outline-hidden"
             >
-              {stageReq.requiredDocuments.map((docItem) => (
+              {availableDocTypes.map((docItem) => (
                 <option key={docItem} value={docItem}>
                   {docItem}
                 </option>
@@ -203,18 +235,33 @@ export const DocumentUploadScreen: React.FC = () => {
 
           {/* Document Preview Box */}
           {fileUri ? (
-            <div className="p-3 bg-[#F7F9FF] border border-[#D5E3FF] rounded-2xl flex items-center justify-between gap-3">
+            <div className="p-3.5 bg-[#F7F9FF] border border-[#D5E3FF] rounded-2xl flex items-center justify-between gap-3">
               <div className="flex items-center gap-3 min-w-0">
-                <img
-                  src={fileUri}
-                  alt="Receipt Preview"
-                  className="w-12 h-12 object-cover rounded-xl border border-white shadow-xs"
-                />
+                {fileUri.startsWith('data:image') ? (
+                  <img
+                    src={fileUri}
+                    alt="Receipt Preview"
+                    className="w-12 h-12 object-cover rounded-xl border border-white shadow-xs"
+                  />
+                ) : (
+                  <div className="w-12 h-12 rounded-xl bg-[#005FB0]/10 border border-[#005FB0]/30 flex items-center justify-center text-[#005FB0] shrink-0">
+                    <FileText className="w-6 h-6" />
+                  </div>
+                )}
                 <div className="min-w-0">
                   <span className="font-bold text-xs text-[#1B1B1F] truncate block">
                     {documentName}
                   </span>
-                  <span className="text-[10px] text-[#1B873F] font-bold">Image Attached</span>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-[10px] text-[#1B873F] font-bold flex items-center gap-1">
+                      <CheckCircle2 className="w-3 h-3" /> Ready for upload
+                    </span>
+                    {fileSizeKB > 0 && (
+                      <span className="text-[10px] text-[#74777F] font-mono">
+                        ({fileSizeKB} KB / 1024 KB max)
+                      </span>
+                    )}
+                  </div>
                 </div>
               </div>
 
@@ -223,9 +270,10 @@ export const DocumentUploadScreen: React.FC = () => {
                 onClick={() => {
                   setFileUri(null);
                   setDocumentName('');
+                  setFileSizeKB(0);
                 }}
-                className="p-1.5 text-[#BA1A1A] hover:bg-[#FFDAD6] rounded-lg transition-colors"
-                title="Remove photo"
+                className="p-1.5 text-[#BA1A1A] hover:bg-[#FFDAD6] rounded-lg transition-colors cursor-pointer"
+                title="Remove attached file"
               >
                 <Trash2 className="w-4 h-4" />
               </button>
@@ -300,10 +348,20 @@ export const DocumentUploadScreen: React.FC = () => {
           {/* Submit Button */}
           <button
             type="submit"
-            className="w-full py-3.5 px-4 bg-[#1B873F] hover:bg-[#157347] active:scale-[0.99] text-white font-bold text-sm rounded-xl shadow-lg flex items-center justify-center gap-2 transition-all cursor-pointer"
+            disabled={isUploading}
+            className="w-full py-3.5 px-4 bg-[#1B873F] hover:bg-[#157347] active:scale-[0.99] disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold text-sm rounded-xl shadow-lg flex items-center justify-center gap-2 transition-all cursor-pointer"
           >
-            <CheckCircle2 className="w-4 h-4 text-[#D4F5DC]" />
-            <span>Submit for Institutional Audit</span>
+            {isUploading ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Uploading to GitHub…</span>
+              </>
+            ) : (
+              <>
+                <CheckCircle2 className="w-4 h-4 text-[#D4F5DC]" />
+                <span>Submit for Institutional Audit</span>
+              </>
+            )}
           </button>
         </form>
       </div>

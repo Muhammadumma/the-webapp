@@ -64,7 +64,7 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
       label: 'AI Assistant',
       sublabel: 'Clearance Advisor',
       icon: Sparkles,
-      badge: 'Gemini',
+      badge: 'AI',
       badgeColor: 'bg-[#E0E7FF] text-[#3730A3]'
     },
     {

@@ -25,11 +25,13 @@ import {
   ChatMessage,
   ClearanceDocument,
   ClearanceStage,
+  RequirementPolicy,
   StudentProfile,
   StudentUserEntity
 } from '../types/clearance';
 import { createCleanJigawaPolyStages, getRequirementForStage } from '../data/departmentRequirements';
 import { askGeminiClearanceAssistant } from '../services/geminiService';
+import { uploadFileToGitHub, uploadDataUriToGitHub } from '../services/githubStorageService';
 
 interface ClearanceContextType {
   studentProfile: StudentProfile;
@@ -43,6 +45,8 @@ interface ClearanceContextType {
   isAiThinking: boolean;
   isAdminMode: boolean;
   authLoading: boolean;
+  requirements: RequirementPolicy[];
+  getDynamicRequirementsForStage: (stageId: number) => RequirementPolicy[];
   // Actions
   selectTab: (tab: number) => void;
   openUploadScreen: (stageId?: number) => void;
@@ -54,10 +58,11 @@ interface ClearanceContextType {
     paymentDate: string,
     docType?: string,
     fileUri?: string | null,
-    remarks?: string | null
-  ) => void;
+    remarks?: string | null,
+    pickedFile?: File | null
+  ) => Promise<void>;
   deleteDocument: (docId: string | number) => void;
-  loginStudent: (matricOrEmail: string, pin: string) => Promise<{ success: boolean; message: string }>;
+  loginStudent: (email: string, pin: string) => Promise<{ success: boolean; message: string }>;
   registerStudent: (
     matric: string,
     name: string,
@@ -80,11 +85,62 @@ interface ClearanceContextType {
 const ClearanceContext = createContext<ClearanceContextType | undefined>(undefined);
 
 const STORAGE_KEY_PREFIX = 'jsp_clearance_';
+const STORAGE_VERSION = 'v4'; // increment when stage order changes
+
+// Clear stale localStorage data if storage version changed
+const storedVersion = localStorage.getItem(`${STORAGE_KEY_PREFIX}version`);
+if (storedVersion !== STORAGE_VERSION) {
+  ['stages', 'documents', 'activities', 'alerts', 'chat', 'profile'].forEach(k => {
+    localStorage.removeItem(`${STORAGE_KEY_PREFIX}${k}`);
+  });
+  localStorage.setItem(`${STORAGE_KEY_PREFIX}version`, STORAGE_VERSION);
+}
+
+const getStageKey = (stageId: number): string => {
+  switch (stageId) {
+    case 1: return 'admission';
+    case 2: return 'faculty';
+    case 3: return 'bursary';
+    case 4: return 'library';
+    case 5: return 'sports';
+    case 6: return 'student_affairs';
+    case 7: return 'accommodation';
+    case 8: return 'graduation';
+    default: return 'admission';
+  }
+};
 
 export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [stages, setStages] = useState<ClearanceStage[]>(() => {
+    const canonical = createCleanJigawaPolyStages();
     const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}stages`);
-    return saved ? JSON.parse(saved) : createCleanJigawaPolyStages();
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          return canonical.map((cleanStage) => {
+            const st = parsed.find((s: any) => s.id === cleanStage.id || s.stageNumber === cleanStage.id);
+            return st
+              ? {
+                  ...cleanStage,
+                  status: st.status || cleanStage.status,
+                  documentStatus: st.documentStatus || cleanStage.documentStatus,
+                  approvalDate: st.approvalDate,
+                  rejectionReason: st.rejectionReason,
+                  documentName: st.documentName,
+                  receiptNumber: st.receiptNumber,
+                  paymentDate: st.paymentDate,
+                  isActionRequired: st.isActionRequired,
+                  actionButtonText: st.actionButtonText || cleanStage.actionButtonText,
+                }
+              : cleanStage;
+          });
+        }
+      } catch (e) {
+        console.warn('Stages parse warning:', e);
+      }
+    }
+    return canonical;
   });
 
   const [documents, setDocuments] = useState<ClearanceDocument[]>(() => {
@@ -94,45 +150,17 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const [activities, setActivities] = useState<ActivityItem[]>(() => {
     const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}activities`);
-    return saved ? JSON.parse(saved) : [
-      {
-        id: 1,
-        title: "Clearance Portal Connected",
-        description: "Firebase server authentication and digital dossier services initialized.",
-        timeAgo: "Just now",
-        status: "READY",
-        stageId: 1
-      }
-    ];
+    return saved ? JSON.parse(saved) : [];
   });
 
   const [alerts, setAlerts] = useState<AlertItem[]>(() => {
     const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}alerts`);
-    return saved ? JSON.parse(saved) : [
-      {
-        id: 1,
-        title: "Stage 1: Admission Credentials Required",
-        description: "Please upload your JAMB Admission Letter / JSP Admission slip and acceptance receipt to begin clearance.",
-        timeAgo: "Just now",
-        isUrgent: true,
-        isRead: false,
-        stageId: 1
-      }
-    ];
+    return saved ? JSON.parse(saved) : [];
   });
 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => {
     const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}chat`);
-    return saved ? JSON.parse(saved) : [
-      {
-        id: 1,
-        isFromUser: false,
-        text: "Welcome to the **Jigawa State Polytechnic Dutse** Digital Clearance Portal! You can track all 8 departmental clearance stages, upload receipts, and check your status here. How can I assist you today?",
-        timestamp: Date.now(),
-        actionButtonText: "Upload Stage 1",
-        actionStageId: 1
-      }
-    ];
+    return saved ? JSON.parse(saved) : [];
   });
 
   const [studentProfile, setStudentProfile] = useState<StudentProfile>(() => {
@@ -141,10 +169,10 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       studentId: "",
       fullName: "",
       email: "",
-      faculty: "School of Technology & Applied Sciences",
-      department: "Computer Telecommunication Engineering (CTE)",
-      level: "ND I",
-      session: "2024/2025 Academic Session",
+      faculty: "",
+      department: "",
+      level: "",
+      session: "",
       matricNumber: "",
       clearancePin: "",
       role: "student",
@@ -159,6 +187,14 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [isAiThinking, setIsAiThinking] = useState<boolean>(false);
   const [isAdminMode, setIsAdminMode] = useState<boolean>(false);
   const [authLoading, setAuthLoading] = useState<boolean>(false);
+  const [requirements, setRequirements] = useState<RequirementPolicy[]>([]);
+
+  const getDynamicRequirementsForStage = (stageId: number): RequirementPolicy[] => {
+    const key = getStageKey(stageId);
+    return requirements.filter(
+      (r) => (r.stageId === key || r.stageId === String(stageId)) && r.active
+    );
+  };
 
   // Helper to safely write clearance state into Firestore
   const syncClearanceToFirestore = async (
@@ -241,54 +277,67 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   // Listen to Firebase Auth state and real-time Firestore synchronization
   useEffect(() => {
-    let unsubscribeDoc: (() => void) | null = null;
+    let unsubscribeRecord: (() => void) | null = null;
+    let unsubscribeUser: (() => void) | null = null;
+    let unsubscribeDocs: (() => void) | null = null;
+    let unsubscribeSubmissions: (() => void) | null = null;
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser: User | null) => {
       if (firebaseUser) {
         try {
           const userDocRef = doc(db, "jsp_students", firebaseUser.uid);
           const recordDocRef = doc(db, "jsp_clearance_records", firebaseUser.uid);
+          const docsQuery = query(collection(db, "jsp_documents"), where("studentUid", "==", firebaseUser.uid));
 
-          const docSnap = await getDoc(userDocRef);
-          if (docSnap.exists()) {
-            const data = docSnap.data();
-            setStudentProfile(prev => ({
-              ...prev,
-              studentId: data.matricNumber || firebaseUser.uid.slice(0, 10),
-              fullName: data.fullName || firebaseUser.displayName || prev.fullName || "JSP Student",
-              email: data.email || firebaseUser.email || prev.email,
-              faculty: data.faculty || prev.faculty || "School of Technology & Applied Sciences",
-              department: data.department || prev.department || "Computer Science",
-              level: data.level || prev.level || "ND II",
-              session: data.session || prev.session || "2024/2025 Academic Session",
-              matricNumber: data.matricNumber || prev.matricNumber || "JSP/ND/CS/22/0149",
-              clearancePin: data.clearancePin || prev.clearancePin || `JSP-CLR-${Math.floor(1000 + Math.random() * 9000)}`,
-              role: "student",
-              isLoggedIn: true,
-              loginPin: "******",
-              lastLoginTime: "Just now"
-            }));
+          // Real-time listener on student user profile
+          unsubscribeUser = onSnapshot(userDocRef, (userSnap) => {
+            if (userSnap.exists()) {
+              const data = userSnap.data();
+              setStudentProfile(prev => ({
+                ...prev,
+                studentId: data.matricNumber || firebaseUser.uid.slice(0, 10),
+                fullName: data.fullName || firebaseUser.displayName || prev.fullName || "",
+                email: data.email || firebaseUser.email || prev.email,
+                faculty: data.faculty || prev.faculty || "School of Technology & Applied Sciences",
+                department: data.department || prev.department || "",
+                level: data.level || prev.level || "ND I",
+                session: data.session || prev.session || "2024/2025 Academic Session",
+                matricNumber: data.matricNumber || prev.matricNumber || "",
+                clearancePin: data.clearancePin || prev.clearancePin || "",
+                role: "student",
+                isLoggedIn: true,
+                loginPin: "******",
+                lastLoginTime: "Just now"
+              }));
+            }
+          });
 
-            if (data.stages && Array.isArray(data.stages) && data.stages.length > 0) {
-              setStages(data.stages);
-            }
-            if (data.documents && Array.isArray(data.documents)) {
-              setDocuments(data.documents);
-            }
-            if (data.activities && Array.isArray(data.activities)) {
-              setActivities(data.activities);
-            }
-            if (data.alerts && Array.isArray(data.alerts)) {
-              setAlerts(data.alerts);
-            }
-          }
-
-          // Setup real-time listener on clearance record
-          unsubscribeDoc = onSnapshot(recordDocRef, (recordSnap) => {
+          // Real-time listener on clearance stages and records
+          unsubscribeRecord = onSnapshot(recordDocRef, (recordSnap) => {
             if (recordSnap.exists()) {
               const recData = recordSnap.data();
               if (recData.stages && Array.isArray(recData.stages)) {
-                setStages(recData.stages);
+                const canonical = createCleanJigawaPolyStages();
+                const normalized = canonical.map((cleanStage) => {
+                  const saved = recData.stages.find(
+                    (s: any) => s.id === cleanStage.id || s.stageNumber === cleanStage.id
+                  );
+                  return saved
+                    ? {
+                        ...cleanStage,
+                        status: saved.status || cleanStage.status,
+                        documentStatus: saved.documentStatus || cleanStage.documentStatus,
+                        approvalDate: saved.approvalDate,
+                        rejectionReason: saved.rejectionReason,
+                        documentName: saved.documentName,
+                        receiptNumber: saved.receiptNumber,
+                        paymentDate: saved.paymentDate,
+                        isActionRequired: saved.isActionRequired,
+                        actionButtonText: saved.actionButtonText || cleanStage.actionButtonText,
+                      }
+                    : cleanStage;
+                });
+                setStages(normalized);
               }
               if (recData.documents && Array.isArray(recData.documents)) {
                 setDocuments(recData.documents);
@@ -302,20 +351,184 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             }
           });
 
+          // Real-time listener on individual submitted documents
+          unsubscribeDocs = onSnapshot(docsQuery, (docsSnap) => {
+            if (!docsSnap.empty) {
+              const loadedDocs: ClearanceDocument[] = docsSnap.docs.map(d => {
+                const docData = d.data();
+                return {
+                  id: docData.id || d.id,
+                  stageId: docData.stageId || 1,
+                  stageTitle: docData.stageTitle || `Stage ${docData.stageId || 1}`,
+                  documentType: docData.documentType || docData.docType || "PDF Document",
+                  fileName: docData.fileName || docData.docName || "Submitted Document",
+                  uploadDate: docData.uploadDate || new Date().toISOString(),
+                  receiptNumber: docData.receiptNumber || "",
+                  paymentDate: docData.paymentDate || "",
+                  status: (docData.status === "APPROVED" ? "APPROVED" : docData.status === "REJECTED" ? "REJECTED" : "PENDING_REVIEW") as any,
+                  fileUri: docData.fileUri || null,
+                  remarks: docData.remarks || "Uploaded via Portal"
+                };
+              });
+              setDocuments(loadedDocs);
+            }
+          });
+
+          // Real-time listener on admin submissions collection for instant review reflection
+          const submissionsQuery = query(collection(db, "submissions"), where("studentId", "==", firebaseUser.uid));
+          unsubscribeSubmissions = onSnapshot(submissionsQuery, (subSnap) => {
+            if (subSnap.empty) return;
+
+            const stageMap: Record<string, number> = {
+              admission: 1,
+              faculty: 2,
+              bursary: 3,
+              library: 4,
+              sports: 5,
+              student_affairs: 6,
+              accommodation: 7,
+              graduation: 8
+            };
+
+            // Collect all reviewed statuses from submissions
+            const approvedStages = new Set<number>();
+            const rejectedStages = new Map<number, string>();
+
+            subSnap.docs.forEach((d) => {
+              const sub = d.data();
+              const matchedStageId = stageMap[sub.stageId] || 1;
+              if (sub.status === 'approved') {
+                approvedStages.add(matchedStageId);
+              } else if (sub.status === 'rejected') {
+                rejectedStages.set(matchedStageId, sub.rejectionReason || sub.reviewComment || 'Document requires re-submission');
+              }
+            });
+
+            // Apply all stage status changes in a single pass
+            setStages(prevStages => prevStages.map(s => {
+              if (approvedStages.has(s.id)) {
+                return {
+                  ...s,
+                  status: 'COMPLETED' as const,
+                  documentStatus: 'APPROVED' as const,
+                  rejectionReason: null,
+                  isActionRequired: false,
+                  approvalDate: 'Verified by Officer'
+                };
+              }
+              if (rejectedStages.has(s.id)) {
+                return {
+                  ...s,
+                  status: 'ACTION_REQUIRED' as const,
+                  documentStatus: 'REJECTED' as const,
+                  rejectionReason: rejectedStages.get(s.id)!,
+                  isActionRequired: true,
+                  actionButtonText: 'Re-upload Now'
+                };
+              }
+              // Unlock the next stage after the highest approved stage
+              const prevStageId = s.id - 1;
+              if (prevStageId > 0 && approvedStages.has(prevStageId) && s.status === 'LOCKED') {
+                return { ...s, status: 'READY' as const, actionButtonText: 'Start Clearance' };
+              }
+              return s;
+            }));
+
+            // Push deduplicated alerts for newly approved stages (one per stage)
+            setAlerts(prevAlerts => {
+              let updated = [...prevAlerts];
+              approvedStages.forEach(stageId => {
+                const alreadyExists = updated.some(a =>
+                  (a as any).stageId === stageId && a.title?.includes('Approved')
+                );
+                if (!alreadyExists) {
+                  const stageName = Object.entries(stageMap).find(([, v]) => v === stageId)?.[0] || `Stage ${stageId}`;
+                  updated = [
+                    {
+                      id: `approval_${stageId}_${Date.now()}`,
+                      title: `Stage ${stageId} Clearance Approved`,
+                      message: `Your submission for Stage ${stageId} (${stageName.replace('_', ' ')}) has been verified and approved.`,
+                      type: 'success' as const,
+                      read: false,
+                      urgent: false,
+                      stageId,
+                      createdAt: new Date().toISOString()
+                    } as any,
+                    ...updated.filter(a => !((a as any).stageId === stageId && a.title?.includes('Approved')))
+                  ];
+                }
+              });
+              rejectedStages.forEach((reason, stageId) => {
+                const alreadyExists = updated.some(a =>
+                  (a as any).stageId === stageId && a.title?.includes('Rejected')
+                );
+                if (!alreadyExists) {
+                  updated = [
+                    {
+                      id: `rejection_${stageId}_${Date.now()}`,
+                      title: `Stage ${stageId}: Action Required`,
+                      message: reason,
+                      type: 'error' as const,
+                      read: false,
+                      urgent: true,
+                      stageId,
+                      createdAt: new Date().toISOString()
+                    } as any,
+                    ...updated
+                  ];
+                }
+              });
+              return updated;
+            });
+          });
+
         } catch (e) {
           console.warn("Firestore auth sync info:", e);
         }
       } else {
-        if (unsubscribeDoc) {
-          unsubscribeDoc();
-          unsubscribeDoc = null;
+        if (unsubscribeRecord) {
+          unsubscribeRecord();
+          unsubscribeRecord = null;
+        }
+        if (unsubscribeUser) {
+          unsubscribeUser();
+          unsubscribeUser = null;
+        }
+        if (unsubscribeDocs) {
+          unsubscribeDocs();
+          unsubscribeDocs = null;
+        }
+        if (unsubscribeSubmissions) {
+          unsubscribeSubmissions();
+          unsubscribeSubmissions = null;
         }
       }
     });
 
+    // Global requirements listener (live sync with Admin Stage Document Requirements Policy)
+    const unsubscribeRequirements = onSnapshot(
+      collection(db, 'requirements'),
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const loaded = snapshot.docs.map((d) => ({
+            id: d.id,
+            ...(d.data() as Omit<RequirementPolicy, 'id'>),
+          }));
+          setRequirements(loaded);
+        }
+      },
+      (err) => {
+        console.warn('Requirements listener notice:', err);
+      }
+    );
+
     return () => {
       unsubscribeAuth();
-      if (unsubscribeDoc) unsubscribeDoc();
+      unsubscribeRequirements();
+      if (unsubscribeRecord) unsubscribeRecord();
+      if (unsubscribeUser) unsubscribeUser();
+      if (unsubscribeDocs) unsubscribeDocs();
+      if (unsubscribeSubmissions) unsubscribeSubmissions();
     };
   }, []);
 
@@ -339,12 +552,41 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     paymentDate: string,
     docType?: string,
     fileUri?: string | null,
-    remarks?: string | null
+    remarks?: string | null,
+    pickedFile?: File | null
   ) => {
     const currentStage = stages.find(s => s.id === stageId) || stages[0];
     const req = getRequirementForStage(stageId);
     const selectedDocType = docType || req.primaryDocumentLabel;
     const documentId = `doc_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    const uid = auth.currentUser?.uid || studentProfile.studentId || 'guest';
+    const stageKey = getStageKey(stageId);
+
+    // ── STEP 1: Upload file to GitHub (preferred) or keep data URI (camera) ──
+    let resolvedFileUri: string | null = fileUri || null;
+    let githubPath: string | null = null;
+
+    try {
+      if (pickedFile) {
+        // Real File object → push to GitHub repo
+        const result = await uploadFileToGitHub(pickedFile, uid, stageKey);
+        resolvedFileUri = result.downloadUrl;
+        githubPath = result.path;
+        console.log('✅ File uploaded to GitHub:', result.downloadUrl);
+      } else if (fileUri && fileUri.startsWith('data:')) {
+        // Camera data URI → push to GitHub repo
+        const ext = fileUri.split(';')[0].split('/')[1] || 'jpg';
+        const cameraFileName = `Camera_${Date.now()}.${ext}`;
+        const result = await uploadDataUriToGitHub(fileUri, cameraFileName, uid, stageKey);
+        resolvedFileUri = result.downloadUrl;
+        githubPath = result.path;
+        console.log('✅ Camera image uploaded to GitHub:', result.downloadUrl);
+      }
+    } catch (uploadErr: any) {
+      console.error('GitHub upload error:', uploadErr);
+      // Throw so the UI can show an error — do not silently swallow
+      throw new Error(`File upload failed: ${uploadErr.message || 'GitHub API error'}. Please try again.`);
+    }
 
     const newDoc: ClearanceDocument = {
       id: documentId,
@@ -352,7 +594,7 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       stageTitle: currentStage.title,
       documentType: selectedDocType,
       fileName: docName,
-      fileUri: fileUri || null,
+      fileUri: resolvedFileUri,
       receiptNumber: receiptNum || `${req.defaultReceiptPrefix}${Math.floor(1000 + Math.random() * 9000)}`,
       paymentDate: paymentDate || new Date().toISOString().split('T')[0],
       uploadDate: "Just now",
@@ -407,9 +649,14 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     setUploadScreenStageId(null);
 
-    // Save individual document record to Firestore collection "jsp_documents"
+    // Save individual document record to Firestore collections for real-time admin review
     try {
       const uid = auth.currentUser?.uid || studentProfile.studentId || studentProfile.matricNumber || 'guest';
+      const stageKey = getStageKey(stageId);
+      const fileExt = docName.split('.').pop()?.toLowerCase() || 'pdf';
+      const fileSize = pickedFile ? pickedFile.size : fileUri ? Math.round(fileUri.length * 0.75) : 250000;
+
+      // 1. Primary document record with GitHub Raw Download URL
       const firestoreDocPayload = {
         id: documentId,
         studentUid: uid,
@@ -420,18 +667,70 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         stageTitle: currentStage.title,
         documentType: selectedDocType,
         fileName: docName,
+        fileType: fileExt,
+        fileSize,
         receiptNumber: newDoc.receiptNumber,
         paymentDate: newDoc.paymentDate,
         uploadDate: new Date().toISOString(),
         status: "PENDING_REVIEW",
         remarks: newDoc.remarks,
-        fileUri: fileUri && fileUri.length < 500000 ? fileUri : null,
-        hasAttachment: !!fileUri,
+        fileUri: resolvedFileUri,
+        hasAttachment: !!resolvedFileUri,
         createdAt: Date.now()
       };
+      await setDoc(doc(db, "jsp_documents", String(documentId)), firestoreDocPayload, { merge: true });
 
-      await setDoc(doc(db, "jsp_documents", String(documentId)), firestoreDocPayload);
-      console.log("Document successfully written to Firestore 'jsp_documents':", documentId);
+      // 2. Cross-compatible submission record for Admin review DB
+      const submissionRecord = {
+        id: String(documentId),
+        studentId: uid,
+        studentName: studentProfile.fullName || 'Student',
+        matricNumber: studentProfile.matricNumber || '',
+        departmentName: studentProfile.department || 'Computer Science',
+        requirementId: `req_${stageKey}_${stageId}`,
+        requirementName: selectedDocType,
+        stageId: stageKey,
+        stageName: currentStage.title,
+        fileUrl: resolvedFileUri || '',
+        fileName: docName,
+        fileType: fileExt,
+        fileSize,
+        status: 'pending',
+        submittedAt: new Date().toISOString()
+      };
+      await setDoc(doc(db, "submissions", String(documentId)), submissionRecord, { merge: true });
+
+      // 3. Sync student record for Admin DB
+      const studentAdminRecord = {
+        id: uid,
+        studentId: studentProfile.matricNumber || uid,
+        fullName: studentProfile.fullName || 'Student',
+        matricNumber: studentProfile.matricNumber || '',
+        email: studentProfile.email || '',
+        departmentId: 'dept_1',
+        departmentName: studentProfile.department || 'Computer Science',
+        level: studentProfile.level || 'ND I',
+        session: studentProfile.session || '2024/2025 Academic Session',
+        clearanceStatus: 'in_progress',
+        active: true,
+        createdAt: new Date().toISOString()
+      };
+      await setDoc(doc(db, "students", uid), studentAdminRecord, { merge: true });
+
+      // 4. Send alert to Admin notifications DB
+      const adminNotifId = `notif_${Date.now()}`;
+      const adminNotif = {
+        id: adminNotifId,
+        studentId: uid,
+        title: `New Clearance Upload: ${currentStage.title}`,
+        message: `${studentProfile.fullName} (${studentProfile.matricNumber}) uploaded ${selectedDocType} for review.`,
+        type: 'submission',
+        read: false,
+        createdAt: new Date().toISOString()
+      };
+      await setDoc(doc(db, "notifications", adminNotifId), adminNotif, { merge: true });
+
+      console.log("Document successfully written to Firestore 'jsp_documents' and 'submissions':", documentId);
     } catch (fireErr) {
       console.warn("Firestore document write error:", fireErr);
     }
@@ -467,18 +766,45 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     );
   };
 
-  const loginStudent = async (matricOrEmail: string, pin: string): Promise<{ success: boolean; message: string }> => {
+  const getFirebaseAuthErrorMessage = (error: any): string => {
+    const code = error?.code || '';
+    switch (code) {
+      case 'auth/invalid-email':
+        return 'The email address is improperly formatted.';
+      case 'auth/user-not-found':
+        return 'No registered account found with this email. Please register first.';
+      case 'auth/wrong-password':
+      case 'auth/invalid-credential':
+        return 'Invalid email or password. Please verify your credentials.';
+      case 'auth/email-already-in-use':
+        return 'An account with this email address already exists. Please sign in instead.';
+      case 'auth/weak-password':
+        return 'Password is too weak. Please use at least 6 characters.';
+      case 'auth/operation-not-allowed':
+        return 'Email/Password sign-in provider is disabled in Firebase Console. Please enable Email/Password under Authentication > Sign-in method.';
+      case 'auth/network-request-failed':
+        return 'Network request failed. Please check your internet connection.';
+      case 'auth/too-many-requests':
+        return 'Too many failed login attempts. Access is temporarily disabled. Please try again later.';
+      case 'auth/user-disabled':
+        return 'This account has been disabled by an administrator.';
+      default:
+        return error?.message || 'Firebase authentication failed. Please check your credentials.';
+    }
+  };
+
+  const loginStudent = async (email: string, pin: string): Promise<{ success: boolean; message: string }> => {
     setAuthLoading(true);
-    const trimmed = matricOrEmail.trim();
+    const trimmedEmail = email.trim();
     const trimmedPin = pin.trim();
 
-    if (!trimmed || !trimmedPin) {
+    if (!trimmedEmail || !trimmedPin) {
       setAuthLoading(false);
-      return { success: false, message: "Please enter your Matric Number / Email and Password." };
+      return { success: false, message: "Please enter your Email and Password." };
     }
 
     try {
-      const emailToUse = trimmed.includes("@") ? trimmed : `${trimmed.replace(/\//g, '_')}@jigawapoly.edu.ng`;
+      const emailToUse = trimmedEmail.includes("@") ? trimmedEmail : `${trimmedEmail}@jigawapoly.edu.ng`;
       const userCredential = await signInWithEmailAndPassword(auth, emailToUse, trimmedPin);
       const user = userCredential.user;
 
@@ -497,7 +823,7 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             department: data.department || "Computer Science",
             level: data.level || "ND II",
             session: data.session || "2024/2025 Academic Session",
-            matricNumber: data.matricNumber || trimmed,
+            matricNumber: data.matricNumber || "ND/CTE/M/24/0001",
             clearancePin: data.clearancePin || `JSP-CLR-${Math.floor(1000 + Math.random() * 9000)}`,
             role: "student",
             isLoggedIn: true,
@@ -514,15 +840,17 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         console.warn("Firestore fetch on login warning:", fErr);
       }
 
+      const defaultName = user.displayName || (trimmedEmail.includes("@") ? trimmedEmail.split("@")[0].replace(/[._]/g, ' ').toUpperCase() : "Student");
+
       const profileObj: StudentProfile = loadedProfile || {
-        studentId: trimmed,
-        fullName: user.displayName || "Student",
+        studentId: user.uid.slice(0, 10),
+        fullName: defaultName,
         email: user.email || emailToUse,
         faculty: "School of Technology & Applied Sciences",
         department: "Computer Science",
         level: "ND II",
         session: "2024/2025 Academic Session",
-        matricNumber: trimmed,
+        matricNumber: "ND/CTE/M/24/0001",
         clearancePin: `JSP-CLR-${Math.floor(1000 + Math.random() * 9000)}`,
         role: "student",
         isLoggedIn: true,
@@ -534,28 +862,9 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       setAuthLoading(false);
       return { success: true, message: `Welcome back, ${profileObj.fullName}!` };
     } catch (firebaseErr: any) {
-      console.warn("Firebase sign in fallback:", firebaseErr);
-
-      // Local fallback sign in for instant responsiveness
-      const profileObj: StudentProfile = {
-        studentId: trimmed,
-        fullName: trimmed,
-        email: trimmed.includes("@") ? trimmed : `${trimmed.toLowerCase().replace(/\//g, '.') }@jigawapoly.edu.ng`,
-        faculty: "School of Technology & Applied Sciences",
-        department: "Computer Telecommunication Engineering (CTE)",
-        level: "ND I",
-        session: "2024/2025 Academic Session",
-        matricNumber: trimmed,
-        clearancePin: `JSP-CLR-${Math.floor(1000 + Math.random() * 9000)}`,
-        role: "student",
-        isLoggedIn: true,
-        loginPin: trimmedPin,
-        lastLoginTime: "Just now"
-      };
-
-      setStudentProfile(profileObj);
+      console.error("Firebase sign in error:", firebaseErr);
       setAuthLoading(false);
-      return { success: true, message: `Logged in as ${profileObj.fullName}` };
+      return { success: false, message: getFirebaseAuthErrorMessage(firebaseErr) };
     }
   };
 
@@ -577,6 +886,11 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     if (!trimmedMatric || !trimmedName || !trimmedEmail || !trimmedPin) {
       setAuthLoading(false);
       return { success: false, message: "Please fill in all required fields." };
+    }
+
+    if (trimmedPin.length < 6) {
+      setAuthLoading(false);
+      return { success: false, message: "Password must be at least 6 characters." };
     }
 
     const cleanStages = createCleanJigawaPolyStages();
@@ -658,29 +972,9 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       setAuthLoading(false);
       return { success: true, message: `Registration successful! Clearance initialized for ${trimmedName}.` };
     } catch (firebaseErr: any) {
-      console.warn("Firebase registration fallback:", firebaseErr);
-
-      const randPin = `JSP-CLR-${Math.floor(1000 + Math.random() * 9000)}`;
-      const profileObj: StudentProfile = {
-        studentId: trimmedMatric,
-        fullName: trimmedName,
-        email: trimmedEmail,
-        faculty: "School of Technology & Applied Sciences",
-        department: dept,
-        level: lvl,
-        session: sess,
-        matricNumber: trimmedMatric,
-        clearancePin: randPin,
-        role: "student",
-        isLoggedIn: true,
-        loginPin: trimmedPin,
-        lastLoginTime: "Just now"
-      };
-
-      setStudentProfile(profileObj);
-      resetDemoData();
+      console.error("Firebase registration error:", firebaseErr);
       setAuthLoading(false);
-      return { success: true, message: `Account created for ${trimmedName}!` };
+      return { success: false, message: getFirebaseAuthErrorMessage(firebaseErr) };
     }
   };
 
@@ -690,7 +984,32 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch (e) {
       console.error(e);
     }
-    setStudentProfile(prev => ({ ...prev, isLoggedIn: false }));
+    localStorage.removeItem(`${STORAGE_KEY_PREFIX}stages`);
+    localStorage.removeItem(`${STORAGE_KEY_PREFIX}documents`);
+    localStorage.removeItem(`${STORAGE_KEY_PREFIX}activities`);
+    localStorage.removeItem(`${STORAGE_KEY_PREFIX}alerts`);
+    localStorage.removeItem(`${STORAGE_KEY_PREFIX}chat`);
+    localStorage.removeItem(`${STORAGE_KEY_PREFIX}profile`);
+    setStages(createCleanJigawaPolyStages());
+    setDocuments([]);
+    setActivities([]);
+    setAlerts([]);
+    setChatMessages([]);
+    setStudentProfile({
+      studentId: "",
+      fullName: "",
+      email: "",
+      faculty: "",
+      department: "",
+      level: "",
+      session: "",
+      matricNumber: "",
+      clearancePin: "",
+      role: "student",
+      isLoggedIn: false,
+      loginPin: "",
+      lastLoginTime: ""
+    });
     setSelectedTab(0);
     setUploadScreenStageId(null);
   };
@@ -984,6 +1303,8 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         isAiThinking,
         isAdminMode,
         authLoading,
+        requirements,
+        getDynamicRequirementsForStage,
         selectTab,
         openUploadScreen,
         closeUploadScreen,
