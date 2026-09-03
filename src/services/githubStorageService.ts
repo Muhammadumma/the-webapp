@@ -8,7 +8,7 @@
 /// <reference types="vite/client" />
 
 const env = (import.meta as any).env || {};
-const GITHUB_TOKEN: string = env.VITE_GITHUB_TOKEN || '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';
+const GITHUB_TOKEN: string = env.VITE_GITHUB_TOKEN || '';
 const GITHUB_OWNER: string = env.VITE_GITHUB_OWNER || 'Muhammadumma';
 const GITHUB_REPO: string = env.VITE_GITHUB_REPO || 'the-admin-app';
 const GITHUB_BRANCH: string = env.VITE_GITHUB_BRANCH || 'main';

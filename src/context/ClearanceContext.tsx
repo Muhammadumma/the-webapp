@@ -31,7 +31,7 @@ import {
 } from '../types/clearance';
 import { createCleanJigawaPolyStages, getRequirementForStage } from '../data/departmentRequirements';
 import { askGeminiClearanceAssistant } from '../services/geminiService';
-import { uploadFileToGitHub, uploadDataUriToGitHub } from '../services/githubStorageService';
+import { generateTemplateData } from '../services/documentTemplateService';
 
 interface ClearanceContextType {
   studentProfile: StudentProfile;
@@ -561,45 +561,38 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const documentId = `doc_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
     const uid = auth.currentUser?.uid || studentProfile.studentId || 'guest';
     const stageKey = getStageKey(stageId);
+    const resolvedReceiptNum = receiptNum || `${req.defaultReceiptPrefix}${Math.floor(1000 + Math.random() * 9000)}`;
+    const resolvedPaymentDate = paymentDate || new Date().toISOString().split('T')[0];
+    const resolvedRemarks = remarks || `Submitted via JSP Digital Portal for ${currentStage.title}`;
 
-    // ── STEP 1: Upload file to GitHub (preferred) or keep data URI (camera) ──
-    let resolvedFileUri: string | null = fileUri || null;
-    let githubPath: string | null = null;
-
-    try {
-      if (pickedFile) {
-        // Real File object → push to GitHub repo
-        const result = await uploadFileToGitHub(pickedFile, uid, stageKey);
-        resolvedFileUri = result.downloadUrl;
-        githubPath = result.path;
-        console.log('✅ File uploaded to GitHub:', result.downloadUrl);
-      } else if (fileUri && fileUri.startsWith('data:')) {
-        // Camera data URI → push to GitHub repo
-        const ext = fileUri.split(';')[0].split('/')[1] || 'jpg';
-        const cameraFileName = `Camera_${Date.now()}.${ext}`;
-        const result = await uploadDataUriToGitHub(fileUri, cameraFileName, uid, stageKey);
-        resolvedFileUri = result.downloadUrl;
-        githubPath = result.path;
-        console.log('✅ Camera image uploaded to GitHub:', result.downloadUrl);
-      }
-    } catch (uploadErr: any) {
-      console.error('GitHub upload error:', uploadErr);
-      // Throw so the UI can show an error — do not silently swallow
-      throw new Error(`File upload failed: ${uploadErr.message || 'GitHub API error'}. Please try again.`);
-    }
+    // ── Generate structured document template (replaces file upload) ──
+    const templateData = generateTemplateData({
+      stageId,
+      fullName: studentProfile.fullName || 'Student',
+      matricNumber: studentProfile.matricNumber || '',
+      department: studentProfile.department || '',
+      level: studentProfile.level || 'ND I',
+      session: studentProfile.session || '2024/2025 Academic Session',
+      email: studentProfile.email,
+      receiptNumber: resolvedReceiptNum,
+      paymentDate: resolvedPaymentDate,
+      documentType: selectedDocType,
+      remarks: resolvedRemarks,
+    });
+    const templateJson = JSON.stringify(templateData);
 
     const newDoc: ClearanceDocument = {
       id: documentId,
       stageId,
       stageTitle: currentStage.title,
       documentType: selectedDocType,
-      fileName: docName,
-      fileUri: resolvedFileUri,
-      receiptNumber: receiptNum || `${req.defaultReceiptPrefix}${Math.floor(1000 + Math.random() * 9000)}`,
-      paymentDate: paymentDate || new Date().toISOString().split('T')[0],
-      uploadDate: "Just now",
-      status: "PENDING_REVIEW",
-      remarks: remarks || "Uploaded via JSP Digital Portal"
+      fileName: docName || `${templateData.templateType}_${resolvedReceiptNum}.pdf`,
+      fileUri: null,
+      receiptNumber: resolvedReceiptNum,
+      paymentDate: resolvedPaymentDate,
+      uploadDate: 'Just now',
+      status: 'PENDING_REVIEW',
+      remarks: resolvedRemarks,
     };
 
     const nextDocuments = [newDoc, ...documents];
@@ -609,15 +602,15 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       if (s.id === stageId) {
         return {
           ...s,
-          status: "PENDING" as const,
-          documentName: docName,
-          documentStatus: "PENDING_REVIEW" as const,
-          receiptNumber: newDoc.receiptNumber,
-          paymentDate: newDoc.paymentDate,
+          status: 'PENDING' as const,
+          documentName: newDoc.fileName,
+          documentStatus: 'PENDING_REVIEW' as const,
+          receiptNumber: resolvedReceiptNum,
+          paymentDate: resolvedPaymentDate,
           rejectionReason: null,
           isActionRequired: false,
-          actionButtonText: "Under Review",
-          approvalDate: "Submitted today"
+          actionButtonText: 'Under Review',
+          approvalDate: 'Submitted today',
         };
       }
       return s;
@@ -627,13 +620,13 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const nextActivities: ActivityItem[] = [
       {
         id: Date.now(),
-        title: `${currentStage.title} - ${selectedDocType} Uploaded`,
-        description: `File '${docName}' (Ref: ${newDoc.receiptNumber}) submitted for clearance audit.`,
-        timeAgo: "Just now",
-        status: "PENDING",
-        stageId
+        title: `${currentStage.title} — ${templateData.documentTitle} Generated`,
+        description: `Document '${templateData.documentTitle}' (Ref: ${resolvedReceiptNum}) submitted for clearance audit.`,
+        timeAgo: 'Just now',
+        status: 'PENDING',
+        stageId,
       },
-      ...activities
+      ...activities,
     ];
     setActivities(nextActivities);
 
@@ -642,48 +635,47 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       {
         id: Date.now(),
         isFromUser: false,
-        text: `Your document **${docName}** (${selectedDocType}) for **${currentStage.title}** has been securely submitted! JSP Clearance Officers will audit your submission (Ref: \`${newDoc.receiptNumber}\`).`,
-        timestamp: Date.now()
-      }
+        text: `Your **${templateData.documentTitle}** for **${currentStage.title}** has been generated and submitted! JSP Clearance Officers will review your document (Ref: \`${resolvedReceiptNum}\`).`,
+        timestamp: Date.now(),
+      },
     ]);
 
     setUploadScreenStageId(null);
 
-    // Save individual document record to Firestore collections for real-time admin review
+    // Save to Firestore with templateJson for Admin paper renderer
     try {
-      const uid = auth.currentUser?.uid || studentProfile.studentId || studentProfile.matricNumber || 'guest';
-      const stageKey = getStageKey(stageId);
-      const fileExt = docName.split('.').pop()?.toLowerCase() || 'pdf';
-      const fileSize = pickedFile ? pickedFile.size : fileUri ? Math.round(fileUri.length * 0.75) : 250000;
+      const currentUid = auth.currentUser?.uid || studentProfile.studentId || studentProfile.matricNumber || 'guest';
 
-      // 1. Primary document record with GitHub Raw Download URL
+      // 1. Primary document record
       const firestoreDocPayload = {
         id: documentId,
-        studentUid: uid,
+        studentUid: currentUid,
         matricNumber: studentProfile.matricNumber || '',
         studentName: studentProfile.fullName || '',
         department: studentProfile.department || '',
         stageId,
         stageTitle: currentStage.title,
         documentType: selectedDocType,
-        fileName: docName,
-        fileType: fileExt,
-        fileSize,
-        receiptNumber: newDoc.receiptNumber,
-        paymentDate: newDoc.paymentDate,
+        fileName: newDoc.fileName,
+        fileType: 'template',
+        fileSize: 0,
+        receiptNumber: resolvedReceiptNum,
+        paymentDate: resolvedPaymentDate,
         uploadDate: new Date().toISOString(),
-        status: "PENDING_REVIEW",
-        remarks: newDoc.remarks,
-        fileUri: resolvedFileUri,
-        hasAttachment: !!resolvedFileUri,
-        createdAt: Date.now()
+        status: 'PENDING_REVIEW',
+        remarks: resolvedRemarks,
+        fileUri: null,
+        hasAttachment: false,
+        templateJson,
+        templateType: templateData.templateType,
+        createdAt: Date.now(),
       };
-      await setDoc(doc(db, "jsp_documents", String(documentId)), firestoreDocPayload, { merge: true });
+      await setDoc(doc(db, 'jsp_documents', String(documentId)), firestoreDocPayload, { merge: true });
 
-      // 2. Cross-compatible submission record for Admin review DB
+      // 2. Submission record for Admin review (with templateJson so Admin can render)
       const submissionRecord = {
         id: String(documentId),
-        studentId: uid,
+        studentId: currentUid,
         studentName: studentProfile.fullName || 'Student',
         matricNumber: studentProfile.matricNumber || '',
         departmentName: studentProfile.department || 'Computer Science',
@@ -691,19 +683,21 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         requirementName: selectedDocType,
         stageId: stageKey,
         stageName: currentStage.title,
-        fileUrl: resolvedFileUri || '',
-        fileName: docName,
-        fileType: fileExt,
-        fileSize,
+        fileUrl: '',
+        fileName: newDoc.fileName,
+        fileType: 'template',
+        fileSize: 0,
         status: 'pending',
-        submittedAt: new Date().toISOString()
+        submittedAt: new Date().toISOString(),
+        templateJson,
+        templateType: templateData.templateType,
       };
-      await setDoc(doc(db, "submissions", String(documentId)), submissionRecord, { merge: true });
+      await setDoc(doc(db, 'submissions', String(documentId)), submissionRecord, { merge: true });
 
       // 3. Sync student record for Admin DB
       const studentAdminRecord = {
-        id: uid,
-        studentId: studentProfile.matricNumber || uid,
+        id: currentUid,
+        studentId: studentProfile.matricNumber || currentUid,
         fullName: studentProfile.fullName || 'Student',
         matricNumber: studentProfile.matricNumber || '',
         email: studentProfile.email || '',
@@ -713,26 +707,25 @@ export const ClearanceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         session: studentProfile.session || '2024/2025 Academic Session',
         clearanceStatus: 'in_progress',
         active: true,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
       };
-      await setDoc(doc(db, "students", uid), studentAdminRecord, { merge: true });
+      await setDoc(doc(db, 'students', currentUid), studentAdminRecord, { merge: true });
 
-      // 4. Send alert to Admin notifications DB
+      // 4. Admin notification
       const adminNotifId = `notif_${Date.now()}`;
-      const adminNotif = {
+      await setDoc(doc(db, 'notifications', adminNotifId), {
         id: adminNotifId,
-        studentId: uid,
-        title: `New Clearance Upload: ${currentStage.title}`,
-        message: `${studentProfile.fullName} (${studentProfile.matricNumber}) uploaded ${selectedDocType} for review.`,
+        studentId: currentUid,
+        title: `New Document: ${currentStage.title}`,
+        message: `${studentProfile.fullName} (${studentProfile.matricNumber}) submitted a ${templateData.documentTitle} for review.`,
         type: 'submission',
         read: false,
-        createdAt: new Date().toISOString()
-      };
-      await setDoc(doc(db, "notifications", adminNotifId), adminNotif, { merge: true });
+        createdAt: new Date().toISOString(),
+      }, { merge: true });
 
-      console.log("Document successfully written to Firestore 'jsp_documents' and 'submissions':", documentId);
+      console.log('✅ Template document written to Firestore:', documentId);
     } catch (fireErr) {
-      console.warn("Firestore document write error:", fireErr);
+      console.warn('Firestore document write error:', fireErr);
     }
 
     // Sync all progress records to Firestore
